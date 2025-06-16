@@ -249,12 +249,19 @@ void LaserMapping::SubAndPubToROS(ros::NodeHandle &nh) {
     sub_imu_ = nh.subscribe<sensor_msgs::Imu>(imu_topic, 200000,
                                               [this](const sensor_msgs::Imu::ConstPtr &msg) { IMUCallBack(msg); });
 
+    // PGO-related subscribers
+    sub_pgo_odom_ = nh.subscribe<nav_msgs::Odometry>("/aft_pgo_odom", 100,
+                                                     [this](const nav_msgs::Odometry::ConstPtr &msg) { PGOOdomCallBack(msg); });
+    sub_keyframes_id_ = nh.subscribe<std_msgs::Header>("/key_frames_ids", 100,
+                                                       [this](const std_msgs::Header::ConstPtr &msg) { KeyFrameIdCallBack(msg); });
+
     // ROS publisher init
     path_.header.stamp = ros::Time::now();
     path_.header.frame_id = tf_world_frame_;
 
     pub_laser_cloud_world_ = nh.advertise<sensor_msgs::PointCloud2>("/cloud_registered", 100000);
     pub_laser_cloud_body_ = nh.advertise<sensor_msgs::PointCloud2>("/cloud_registered_body", 100000);
+    pub_laser_cloud_lidar_ = nh.advertise<sensor_msgs::PointCloud2>("/cloud_registered_lidar", 100000);  // for PGO
     pub_laser_cloud_effect_world_ = nh.advertise<sensor_msgs::PointCloud2>("/cloud_registered_effect_world", 100000);
     pub_odom_aft_mapped_ = nh.advertise<nav_msgs::Odometry>("/Odometry", 100000);
     pub_path_ = nh.advertise<nav_msgs::Path>("/path", 100000);
@@ -350,6 +357,7 @@ void LaserMapping::Run() {
         }
         if (scan_pub_en_ && scan_body_pub_en_) {
             PublishFrameBody(pub_laser_cloud_body_);
+            PublishFrameLidar(pub_laser_cloud_lidar_);  // for PGO - publish lidar frame
         }
         if (scan_pub_en_ && scan_effect_pub_en_) {
             PublishFrameEffectWorld(pub_laser_cloud_effect_world_);
@@ -434,6 +442,28 @@ void LaserMapping::IMUCallBack(const sensor_msgs::Imu::ConstPtr &msg_in) {
     last_timestamp_imu_ = timestamp;
     imu_buffer_.emplace_back(msg);
     mtx_buffer_.unlock();
+}
+
+void LaserMapping::PGOOdomCallBack(const nav_msgs::Odometry::ConstPtr &msg) {
+    // Receive corrected odometry from PGO backend
+    odom_aft_pgo_ = *msg;
+    pgo_correction_available_ = true;
+    
+    // Update the corrected path
+    geometry_msgs::PoseStamped pose_stamped;
+    pose_stamped.header = msg->header;
+    pose_stamped.pose = msg->pose.pose;
+    path_updated_.poses.push_back(pose_stamped);
+    path_updated_.header = msg->header;
+    path_updated_.header.frame_id = "camera_init";
+    
+    LOG(INFO) << "Received PGO corrected odometry at time: " << msg->header.stamp.toSec();
+}
+
+void LaserMapping::KeyFrameIdCallBack(const std_msgs::Header::ConstPtr &msg) {
+    // Receive keyframe IDs from PGO backend
+    keyframe_ids_.push_back(msg->seq);
+    LOG(INFO) << "Received keyframe ID: " << msg->seq;
 }
 
 bool LaserMapping::SyncPackages() {
@@ -770,6 +800,15 @@ void LaserMapping::PublishFrameBody(const ros::Publisher &pub_laser_cloud_body) 
     laserCloudmsg.header.frame_id = "body";
     pub_laser_cloud_body.publish(laserCloudmsg);
     publish_count_ -= options::PUBFRAME_PERIOD;
+}
+
+void LaserMapping::PublishFrameLidar(const ros::Publisher &pub_laser_cloud_lidar) {
+    // Publish point cloud in lidar frame for PGO (ScanContext needs lidar-centric coordinates)
+    sensor_msgs::PointCloud2 laserCloudmsg;
+    pcl::toROSMsg(*scan_undistort_, laserCloudmsg);
+    laserCloudmsg.header.stamp = ros::Time().fromSec(lidar_end_time_);
+    laserCloudmsg.header.frame_id = "lidar";
+    pub_laser_cloud_lidar.publish(laserCloudmsg);
 }
 
 void LaserMapping::PublishFrameEffectWorld(const ros::Publisher &pub_laser_cloud_effect_world) {

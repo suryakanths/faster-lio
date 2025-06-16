@@ -3,6 +3,7 @@
 
 #include <livox_ros_driver/CustomMsg.h>
 #include <nav_msgs/Path.h>
+#include <std_msgs/Header.h>
 #include <pcl/filters/voxel_grid.h>
 #include <ros/ros.h>
 #include <sensor_msgs/PointCloud2.h>
@@ -46,6 +47,10 @@ class LaserMapping {
     void StandardPCLCallBack(const sensor_msgs::PointCloud2::ConstPtr &msg);
     void LivoxPCLCallBack(const livox_ros_driver::CustomMsg::ConstPtr &msg);
     void IMUCallBack(const sensor_msgs::Imu::ConstPtr &msg_in);
+    
+    // PGO callbacks
+    void PGOOdomCallBack(const nav_msgs::Odometry::ConstPtr &msg);
+    void KeyFrameIdCallBack(const std_msgs::Header::ConstPtr &msg);
 
     // sync lidar with imu
     bool SyncPackages();
@@ -58,6 +63,7 @@ class LaserMapping {
     void PublishOdometry(const ros::Publisher &pub_odom_aft_mapped);
     void PublishFrameWorld();
     void PublishFrameBody(const ros::Publisher &pub_laser_cloud_body);
+    void PublishFrameLidar(const ros::Publisher &pub_laser_cloud_lidar);  // for PGO
     void PublishFrameEffectWorld(const ros::Publisher &pub_laser_cloud_effect_world);
     void Savetrajectory(const std::string &traj_file);
 
@@ -115,9 +121,15 @@ class LaserMapping {
     ros::Subscriber sub_imu_;
     ros::Publisher pub_laser_cloud_world_;
     ros::Publisher pub_laser_cloud_body_;
+    ros::Publisher pub_laser_cloud_lidar_;  // for PGO - lidar frame point cloud
     ros::Publisher pub_laser_cloud_effect_world_;
     ros::Publisher pub_odom_aft_mapped_;
     ros::Publisher pub_path_;
+    
+    // PGO-related subscribers
+    ros::Subscriber sub_pgo_odom_;
+    ros::Subscriber sub_keyframes_id_;
+    
     std::string tf_imu_frame_;
     std::string tf_world_frame_;
 
@@ -126,6 +138,12 @@ class LaserMapping {
     std::deque<PointCloudType::Ptr> lidar_buffer_;
     std::deque<sensor_msgs::Imu::ConstPtr> imu_buffer_;
     nav_msgs::Odometry odom_aft_mapped_;
+    
+    // PGO-related variables
+    nav_msgs::Odometry odom_aft_pgo_;  // corrected odometry from PGO
+    nav_msgs::Path path_updated_;      // corrected path from PGO
+    bool pgo_correction_available_ = false;
+    std::vector<uint32_t> keyframe_ids_;  // received keyframe IDs from PGO
 
     /// options
     bool time_sync_en_ = false;
