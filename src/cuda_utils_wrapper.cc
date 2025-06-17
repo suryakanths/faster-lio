@@ -45,6 +45,27 @@ extern "C" {
                                            float* d_output_intensity,
                                            const int* d_indices,
                                            int num_output_points);
+    
+    // PGO correction functions
+    cudaError_t cuda_apply_pgo_corrections(const float* d_input_x,
+                                         const float* d_input_y,
+                                         const float* d_input_z,
+                                         const float* d_input_intensity,
+                                         const float* d_timestamps,
+                                         float* d_output_x,
+                                         float* d_output_y,
+                                         float* d_output_z,
+                                         float* d_output_intensity,
+                                         const float* d_original_poses,
+                                         const float* d_corrected_poses,
+                                         const float* d_pose_timestamps,
+                                         int num_poses,
+                                         int num_points);
+    
+    cudaError_t cuda_assign_timestamps(float* d_timestamps,
+                                     const int* d_scan_indices,
+                                     const float* d_scan_timestamps,
+                                     int num_points);
 }
 } // namespace cuda_impl
 
@@ -376,13 +397,264 @@ bool CudaPointCloudProcessor::TransformPointCloud(const PointCloudType::Ptr& inp
     return true;
 }
 
-// Additional methods would be implemented similarly...
+bool CudaPointCloudProcessor::ApplyPGOCorrections(const PointCloudType::Ptr& input_cloud,
+                                                PointCloudType::Ptr& output_cloud,
+                                                const std::vector<geometry_msgs::PoseStamped>& original_poses,
+                                                const std::vector<geometry_msgs::PoseStamped>& corrected_poses,
+                                                const std::vector<float>& point_timestamps) {
+    if (!cuda_initialized_ || !input_cloud || input_cloud->empty()) {
+        return false;
+    }
+
+    const size_t num_points = input_cloud->size();
+    const size_t num_poses = std::min(original_poses.size(), corrected_poses.size());
+    
+    if (num_poses == 0) {
+        LOG(ERROR) << "No poses provided for PGO correction";
+        return false;
+    }
+
+    // Allocate GPU memory if needed
+    if (!AllocateGpuMemory(num_points)) {
+        return false;
+    }
+
+    try {
+        // Prepare host data for input points
+        std::vector<float> host_x(num_points), host_y(num_points), host_z(num_points), host_intensity(num_points);
+        std::vector<float> host_timestamps(num_points);
+        
+        for (size_t i = 0; i < num_points; ++i) {
+            const auto& point = input_cloud->points[i];
+            host_x[i] = point.x;
+            host_y[i] = point.y;
+            host_z[i] = point.z;
+            host_intensity[i] = point.intensity;
+            
+            // Use provided timestamps or derive from curvature field
+            if (i < point_timestamps.size()) {
+                host_timestamps[i] = point_timestamps[i];
+            } else {
+                host_timestamps[i] = point.curvature;  // Fallback to curvature field
+            }
+        }
+
+        // Prepare pose data (position + quaternion format: x, y, z, qx, qy, qz, qw)
+        std::vector<float> original_pose_data(num_poses * 7);
+        std::vector<float> corrected_pose_data(num_poses * 7);
+        std::vector<float> pose_timestamps(num_poses);
+        
+        for (size_t i = 0; i < num_poses; ++i) {
+            const auto& orig_pose = original_poses[i];
+            const auto& corr_pose = corrected_poses[i];
+            
+            // Original pose
+            size_t base_idx = i * 7;
+            original_pose_data[base_idx + 0] = orig_pose.pose.position.x;
+            original_pose_data[base_idx + 1] = orig_pose.pose.position.y;
+            original_pose_data[base_idx + 2] = orig_pose.pose.position.z;
+            original_pose_data[base_idx + 3] = orig_pose.pose.orientation.x;
+            original_pose_data[base_idx + 4] = orig_pose.pose.orientation.y;
+            original_pose_data[base_idx + 5] = orig_pose.pose.orientation.z;
+            original_pose_data[base_idx + 6] = orig_pose.pose.orientation.w;
+            
+            // Corrected pose
+            corrected_pose_data[base_idx + 0] = corr_pose.pose.position.x;
+            corrected_pose_data[base_idx + 1] = corr_pose.pose.position.y;
+            corrected_pose_data[base_idx + 2] = corr_pose.pose.position.z;
+            corrected_pose_data[base_idx + 3] = corr_pose.pose.orientation.x;
+            corrected_pose_data[base_idx + 4] = corr_pose.pose.orientation.y;
+            corrected_pose_data[base_idx + 5] = corr_pose.pose.orientation.z;
+            corrected_pose_data[base_idx + 6] = corr_pose.pose.orientation.w;
+            
+            // Pose timestamp
+            pose_timestamps[i] = orig_pose.header.stamp.toSec();
+        }
+
+        // Allocate additional GPU memory for PGO data
+        float* d_timestamps = nullptr;
+        float* d_original_poses = nullptr;
+        float* d_corrected_poses = nullptr;
+        float* d_pose_timestamps = nullptr;
+        
+        cudaError_t error;
+        
+        // Allocate GPU memory for PGO-specific data
+        error = cudaMalloc(&d_timestamps, num_points * sizeof(float));
+        if (error != cudaSuccess) {
+            LOG(ERROR) << "Failed to allocate timestamps GPU memory: " << cudaGetErrorString(error);
+            return false;
+        }
+        
+        error = cudaMalloc(&d_original_poses, num_poses * 7 * sizeof(float));
+        if (error != cudaSuccess) {
+            cudaFree(d_timestamps);
+            LOG(ERROR) << "Failed to allocate original poses GPU memory: " << cudaGetErrorString(error);
+            return false;
+        }
+        
+        error = cudaMalloc(&d_corrected_poses, num_poses * 7 * sizeof(float));
+        if (error != cudaSuccess) {
+            cudaFree(d_timestamps);
+            cudaFree(d_original_poses);
+            LOG(ERROR) << "Failed to allocate corrected poses GPU memory: " << cudaGetErrorString(error);
+            return false;
+        }
+        
+        error = cudaMalloc(&d_pose_timestamps, num_poses * sizeof(float));
+        if (error != cudaSuccess) {
+            cudaFree(d_timestamps);
+            cudaFree(d_original_poses);
+            cudaFree(d_corrected_poses);
+            LOG(ERROR) << "Failed to allocate pose timestamps GPU memory: " << cudaGetErrorString(error);
+            return false;
+        }
+
+        // Copy input data to GPU
+        error = cudaMemcpy(cuda_data_->d_points_x, host_x.data(), num_points * sizeof(float), cudaMemcpyHostToDevice);
+        if (error != cudaSuccess) {
+            LOG(ERROR) << "Failed to copy X data to GPU: " << cudaGetErrorString(error);
+            goto cleanup_and_return_false;
+        }
+        
+        error = cudaMemcpy(cuda_data_->d_points_y, host_y.data(), num_points * sizeof(float), cudaMemcpyHostToDevice);
+        if (error != cudaSuccess) {
+            LOG(ERROR) << "Failed to copy Y data to GPU: " << cudaGetErrorString(error);
+            goto cleanup_and_return_false;
+        }
+        
+        error = cudaMemcpy(cuda_data_->d_points_z, host_z.data(), num_points * sizeof(float), cudaMemcpyHostToDevice);
+        if (error != cudaSuccess) {
+            LOG(ERROR) << "Failed to copy Z data to GPU: " << cudaGetErrorString(error);
+            goto cleanup_and_return_false;
+        }
+        
+        error = cudaMemcpy(cuda_data_->d_points_intensity, host_intensity.data(), num_points * sizeof(float), cudaMemcpyHostToDevice);
+        if (error != cudaSuccess) {
+            LOG(ERROR) << "Failed to copy intensity data to GPU: " << cudaGetErrorString(error);
+            goto cleanup_and_return_false;
+        }
+        
+        error = cudaMemcpy(d_timestamps, host_timestamps.data(), num_points * sizeof(float), cudaMemcpyHostToDevice);
+        if (error != cudaSuccess) {
+            LOG(ERROR) << "Failed to copy timestamps data to GPU: " << cudaGetErrorString(error);
+            goto cleanup_and_return_false;
+        }
+        
+        error = cudaMemcpy(d_original_poses, original_pose_data.data(), num_poses * 7 * sizeof(float), cudaMemcpyHostToDevice);
+        if (error != cudaSuccess) {
+            LOG(ERROR) << "Failed to copy original poses to GPU: " << cudaGetErrorString(error);
+            goto cleanup_and_return_false;
+        }
+        
+        error = cudaMemcpy(d_corrected_poses, corrected_pose_data.data(), num_poses * 7 * sizeof(float), cudaMemcpyHostToDevice);
+        if (error != cudaSuccess) {
+            LOG(ERROR) << "Failed to copy corrected poses to GPU: " << cudaGetErrorString(error);
+            goto cleanup_and_return_false;
+        }
+        
+        error = cudaMemcpy(d_pose_timestamps, pose_timestamps.data(), num_poses * sizeof(float), cudaMemcpyHostToDevice);
+        if (error != cudaSuccess) {
+            LOG(ERROR) << "Failed to copy pose timestamps to GPU: " << cudaGetErrorString(error);
+            goto cleanup_and_return_false;
+        }
+
+        // Call CUDA kernel for PGO corrections
+        error = cuda_impl::cuda_apply_pgo_corrections(
+            cuda_data_->d_points_x, cuda_data_->d_points_y, cuda_data_->d_points_z, cuda_data_->d_points_intensity,
+            d_timestamps,
+            cuda_data_->d_output_x, cuda_data_->d_output_y, cuda_data_->d_output_z, cuda_data_->d_output_intensity,
+            d_original_poses, d_corrected_poses, d_pose_timestamps,
+            static_cast<int>(num_poses), static_cast<int>(num_points)
+        );
+        
+        if (error != cudaSuccess) {
+            LOG(ERROR) << "CUDA PGO correction kernel execution failed: " << cudaGetErrorString(error);
+            goto cleanup_and_return_false;
+        }
+
+        // Copy results back
+        {
+            std::vector<float> output_x(num_points), output_y(num_points), output_z(num_points), output_intensity(num_points);
+            
+            error = cudaMemcpy(output_x.data(), cuda_data_->d_output_x, num_points * sizeof(float), cudaMemcpyDeviceToHost);
+            if (error != cudaSuccess) {
+                LOG(ERROR) << "Failed to copy output X from GPU: " << cudaGetErrorString(error);
+                goto cleanup_and_return_false;
+            }
+            
+            error = cudaMemcpy(output_y.data(), cuda_data_->d_output_y, num_points * sizeof(float), cudaMemcpyDeviceToHost);
+            if (error != cudaSuccess) {
+                LOG(ERROR) << "Failed to copy output Y from GPU: " << cudaGetErrorString(error);
+                goto cleanup_and_return_false;
+            }
+            
+            error = cudaMemcpy(output_z.data(), cuda_data_->d_output_z, num_points * sizeof(float), cudaMemcpyDeviceToHost);
+            if (error != cudaSuccess) {
+                LOG(ERROR) << "Failed to copy output Z from GPU: " << cudaGetErrorString(error);
+                goto cleanup_and_return_false;
+            }
+            
+            error = cudaMemcpy(output_intensity.data(), cuda_data_->d_output_intensity, num_points * sizeof(float), cudaMemcpyDeviceToHost);
+            if (error != cudaSuccess) {
+                LOG(ERROR) << "Failed to copy output intensity from GPU: " << cudaGetErrorString(error);
+                goto cleanup_and_return_false;
+            }
+
+            // Build output cloud
+            output_cloud->clear();
+            output_cloud->resize(num_points);
+            for (size_t i = 0; i < num_points; ++i) {
+                auto& point = output_cloud->points[i];
+                point.x = output_x[i];
+                point.y = output_y[i];
+                point.z = output_z[i];
+                point.intensity = output_intensity[i];
+                
+                // Copy other fields from input
+                const auto& input_point = input_cloud->points[i];
+                point.normal_x = input_point.normal_x;
+                point.normal_y = input_point.normal_y;
+                point.normal_z = input_point.normal_z;
+                point.curvature = input_point.curvature;
+            }
+        }
+
+        // Cleanup PGO-specific GPU memory
+        cudaFree(d_timestamps);
+        cudaFree(d_original_poses);
+        cudaFree(d_corrected_poses);
+        cudaFree(d_pose_timestamps);
+        
+        LOG(INFO) << "Successfully applied CUDA-accelerated PGO corrections to " << num_points << " points using " << num_poses << " pose pairs";
+        return true;
+
+    cleanup_and_return_false:
+        // Cleanup on error
+        if (d_timestamps) cudaFree(d_timestamps);
+        if (d_original_poses) cudaFree(d_original_poses);
+        if (d_corrected_poses) cudaFree(d_corrected_poses);
+        if (d_pose_timestamps) cudaFree(d_pose_timestamps);
+        return false;
+        
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "Exception in CUDA PGO corrections: " << e.what();
+        return false;
+    }
+}
+
 bool CudaPointCloudProcessor::DownsamplePointCloud(const PointCloudType::Ptr& input_cloud,
                                                    PointCloudType::Ptr& output_cloud,
                                                    float voxel_size) {
     // For now, fall back to CPU implementation
     LOG(WARNING) << "CUDA downsampling not yet implemented, falling back to CPU";
     return false;
+}
+
+void CudaPointCloudProcessor::ClearMemory() {
+    if (cuda_initialized_) {
+        DeallocateGpuMemory();
+    }
 }
 
 } // namespace faster_lio

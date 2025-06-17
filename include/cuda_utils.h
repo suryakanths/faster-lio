@@ -10,6 +10,8 @@
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
 #include <Eigen/Core>
+#include <geometry_msgs/PoseStamped.h>
+#include <vector>
 
 // Include Jetson optimizations header for complete type definitions
 #include "jetson_optimizations.h"
@@ -53,6 +55,13 @@ public:
     bool DownsamplePointCloud(const PointCloudType::Ptr& input_cloud,
                              PointCloudType::Ptr& output_cloud,
                              float voxel_size);
+
+    // PGO correction acceleration
+    bool ApplyPGOCorrections(const PointCloudType::Ptr& input_cloud,
+                           PointCloudType::Ptr& output_cloud,
+                           const std::vector<geometry_msgs::PoseStamped>& original_poses,
+                           const std::vector<geometry_msgs::PoseStamped>& corrected_poses,
+                           const std::vector<float>& point_timestamps);
 
     // Memory management
     void ClearMemory();

@@ -26,7 +26,7 @@ def call_save_optimized_map():
         req.apply_pgo_corrections = True
         req.use_advanced_compression = True
         req.voxel_size = 0.1  # 10cm voxel size
-        req.compression_ratio = 0.3  # Target 30% of original points
+        req.compression_ratio = 0.5  # Target 30% of original points
         req.preserve_structure = True
         
         rospy.loginfo("Calling SaveOptimizedMap service...")

@@ -400,6 +400,32 @@ void LaserMapping::Run() {
         },
         "IEKF Solve and Update");
 
+    // Store pose in history for PGO corrections
+    {
+        std::lock_guard<std::mutex> pose_lock(pose_history_mutex_);
+        geometry_msgs::PoseStamped pose_stamped;
+        pose_stamped.header.stamp = ros::Time().fromSec(lidar_end_time_);
+        pose_stamped.header.frame_id = tf_world_frame_;
+        
+        // Set pose directly instead of using template
+        pose_stamped.pose.position.x = state_point_.pos(0);
+        pose_stamped.pose.position.y = state_point_.pos(1);
+        pose_stamped.pose.position.z = state_point_.pos(2);
+        pose_stamped.pose.orientation.x = state_point_.rot.coeffs()[0];
+        pose_stamped.pose.orientation.y = state_point_.rot.coeffs()[1];
+        pose_stamped.pose.orientation.z = state_point_.rot.coeffs()[2];
+        pose_stamped.pose.orientation.w = state_point_.rot.coeffs()[3];
+        
+        pose_history_.push_back(pose_stamped);
+        
+        // Keep only recent poses (last 1000 poses)
+        const size_t max_pose_history = 1000;
+        if (pose_history_.size() > max_pose_history) {
+            pose_history_.erase(pose_history_.begin(), 
+                               pose_history_.begin() + (pose_history_.size() - max_pose_history));
+        }
+    }
+
     // update local map
     Timer::Evaluate([&, this]() { MapIncremental(); }, "    Incremental Mapping");
 
@@ -1180,43 +1206,162 @@ bool LaserMapping::ApplyPGOCorrections(PointCloudType::Ptr& map, const nav_msgs:
     }
     
     try {
-        // This is a simplified implementation
-        // In a real system, you would need to:
-        // 1. Associate each point with its corresponding pose/timestamp
-        // 2. Apply the transformation difference between original and corrected poses
-        // 3. Transform each point accordingly
+        std::lock_guard<std::mutex> pose_lock(pose_history_mutex_);
         
-        // For now, we'll apply a simple correction based on the pose differences
-        // This assumes the map points are in the coordinate frame of the final pose
-        
-        if (corrected_path.poses.size() >= 2) {
-            // Get the transformation from the last original pose to the last corrected pose
-            const auto& last_corrected = corrected_path.poses.back();
-            const auto& current_pose = path_.poses.empty() ? geometry_msgs::PoseStamped() : path_.poses.back();
-            
-            if (!path_.poses.empty()) {
-                // Calculate transformation difference
-                Eigen::Vector3f translation_diff(
-                    last_corrected.pose.position.x - current_pose.pose.position.x,
-                    last_corrected.pose.position.y - current_pose.pose.position.y,
-                    last_corrected.pose.position.z - current_pose.pose.position.z
-                );
-                
-                // Apply translation correction to all points
-                for (auto& point : map->points) {
-                    point.x += translation_diff.x();
-                    point.y += translation_diff.y();
-                    point.z += translation_diff.z();
-                }
-                
-                LOG(INFO) << "Applied PGO correction: translation (" 
-                          << translation_diff.x() << ", " 
-                          << translation_diff.y() << ", " 
-                          << translation_diff.z() << ")";
-            }
+        if (pose_history_.empty()) {
+            LOG(WARNING) << "No pose history available for PGO correction. "
+                         << "Make sure mapping has been running to accumulate pose history.";
+            return false;
         }
         
-        return true;
+        if (corrected_path.poses.empty()) {
+            LOG(WARNING) << "No PGO corrections available. Check if PGO backend is running and publishing corrections.";
+            return false;
+        }
+        
+#ifdef USE_CUDA
+        // Try CUDA-accelerated PGO corrections first
+        if (cuda_processor_ && cuda_processor_->IsCudaAvailable()) {
+            LOG(INFO) << "Applying CUDA-accelerated PGO corrections to " << map->size() << " points";
+            
+            // Convert pose history to geometry_msgs format for CUDA processing
+            std::vector<geometry_msgs::PoseStamped> original_poses;
+            original_poses.reserve(pose_history_.size());
+            
+            for (const auto& pose : pose_history_) {
+                original_poses.push_back(pose);
+            }
+            
+            // Generate timestamp information from point curvature field
+            // (This is a fallback - ideally we'd have proper per-point timestamps)
+            std::vector<float> point_timestamps;
+            point_timestamps.reserve(map->size());
+            
+            for (const auto& point : map->points) {
+                point_timestamps.push_back(point.curvature);  // Using curvature as timestamp
+            }
+            
+            // Create output cloud
+            PointCloudType::Ptr corrected_map(new PointCloudType);
+            
+            // Apply CUDA-accelerated PGO corrections
+            bool cuda_success = cuda_processor_->ApplyPGOCorrections(
+                map, corrected_map, original_poses, corrected_path.poses, point_timestamps
+            );
+            
+            if (cuda_success && !corrected_map->empty()) {
+                // Replace original map with corrected one
+                *map = *corrected_map;
+                
+                LOG(INFO) << "Successfully applied CUDA-accelerated PGO corrections to " << map->size() << " points";
+                
+                // Invalidate cache since we modified the map
+                std::lock_guard<std::mutex> cache_lock(map_cache_mutex_);
+                map_cache_valid_ = false;
+                
+                return true;
+            } else {
+                LOG(WARNING) << "CUDA PGO correction failed, falling back to CPU implementation";
+            }
+        }
+#endif
+        
+        // CPU fallback implementation  
+        LOG(INFO) << "Applying CPU-based PGO corrections to " << map->size() << " points";
+        
+        // For proper PGO correction, we need to:
+        // 1. Segment the accumulated map by scan/timestamp
+        // 2. Apply the specific PGO correction for each scan's timestamp
+        // 3. Transform each scan's points with its corresponding correction
+        
+        size_t total_corrections_applied = 0;
+        size_t original_pose_count = pose_history_.size();
+        size_t corrected_pose_count = corrected_path.poses.size();
+        
+        LOG(INFO) << "Applying per-scan PGO corrections:";
+        LOG(INFO) << "  Original poses: " << original_pose_count;
+        LOG(INFO) << "  Corrected poses: " << corrected_pose_count;
+        
+        // Since we don't have per-point timestamp information in the accumulated map,
+        // we'll apply a segmented correction approach based on pose timeline
+        if (original_pose_count > 0 && corrected_pose_count > 0) {
+            // Calculate number of points per pose segment
+            size_t points_per_segment = map->points.size() / std::min(original_pose_count, corrected_pose_count);
+            if (points_per_segment == 0) points_per_segment = 1;
+            
+            size_t segment_count = std::min(original_pose_count, corrected_pose_count);
+            LOG(INFO) << "  Points per segment: " << points_per_segment;
+            LOG(INFO) << "  Total segments: " << segment_count;
+            
+            for (size_t segment_idx = 0; segment_idx < segment_count; ++segment_idx) {
+                // Get pose indices (work backwards from most recent)
+                size_t orig_idx = original_pose_count - segment_count + segment_idx;
+                size_t corr_idx = corrected_pose_count - segment_count + segment_idx;
+                
+                if (orig_idx >= original_pose_count || corr_idx >= corrected_pose_count) {
+                    continue;
+                }
+                
+                const auto& original_pose = pose_history_[orig_idx];
+                const auto& corrected_pose = corrected_path.poses[corr_idx];
+                
+                // Calculate transformation for this segment
+                Eigen::Vector3f translation_diff(
+                    corrected_pose.pose.position.x - original_pose.pose.position.x,
+                    corrected_pose.pose.position.y - original_pose.pose.position.y,
+                    corrected_pose.pose.position.z - original_pose.pose.position.z
+                );
+                
+                // Calculate rotation difference
+                Eigen::Quaternionf original_quat(
+                    original_pose.pose.orientation.w,
+                    original_pose.pose.orientation.x,
+                    original_pose.pose.orientation.y,
+                    original_pose.pose.orientation.z
+                );
+                
+                Eigen::Quaternionf corrected_quat(
+                    corrected_pose.pose.orientation.w,
+                    corrected_pose.pose.orientation.x,
+                    corrected_pose.pose.orientation.y,
+                    corrected_pose.pose.orientation.z
+                );
+                
+                Eigen::Quaternionf rotation_diff = corrected_quat * original_quat.inverse();
+                Eigen::Matrix3f rotation_matrix = rotation_diff.toRotationMatrix();
+                
+                // Apply transformation to points in this segment
+                size_t start_idx = segment_idx * points_per_segment;
+                size_t end_idx = std::min(start_idx + points_per_segment, map->points.size());
+                
+                for (size_t pt_idx = start_idx; pt_idx < end_idx; ++pt_idx) {
+                    auto& point = map->points[pt_idx];
+                    
+                    // Apply rotation first
+                    Eigen::Vector3f pt(point.x, point.y, point.z);
+                    pt = rotation_matrix * pt;
+                    
+                    // Then apply translation
+                    point.x = pt.x() + translation_diff.x();
+                    point.y = pt.y() + translation_diff.y();
+                    point.z = pt.z() + translation_diff.z();
+                }
+                
+                total_corrections_applied += (end_idx - start_idx);
+                
+                LOG(INFO) << "  Segment " << segment_idx << ": " << (end_idx - start_idx) 
+                          << " points, translation(" << translation_diff.transpose() << ")";
+            }
+            
+            LOG(INFO) << "Applied PGO corrections to " << total_corrections_applied 
+                      << " points across " << segment_count << " segments";
+            
+            // Invalidate cache since we modified the map
+            std::lock_guard<std::mutex> cache_lock(map_cache_mutex_);
+            map_cache_valid_ = false;
+        }
+        
+        return total_corrections_applied > 0;
         
     } catch (const std::exception& e) {
         LOG(ERROR) << "Failed to apply PGO corrections: " << e.what();

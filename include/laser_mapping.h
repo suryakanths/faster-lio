@@ -170,6 +170,12 @@ class LaserMapping {
     nav_msgs::Path path_updated_;      // corrected path from PGO
     bool pgo_correction_available_ = false;
     std::vector<uint32_t> keyframe_ids_;  // received keyframe IDs from PGO
+    std::vector<geometry_msgs::PoseStamped> pose_history_;  // pose history for PGO corrections
+    std::mutex pose_history_mutex_;  // mutex for pose history access
+    
+    // Map caching for optimization
+    std::mutex map_cache_mutex_;  // mutex for map cache access
+    bool map_cache_valid_ = false;  // flag for map cache validity
 
     // Map compression utility
     std::unique_ptr<MapCompression> map_compressor_;
