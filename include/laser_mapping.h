@@ -10,12 +10,14 @@
 #include <condition_variable>
 #include <thread>
 
+#include "faster_lio/SaveOptimizedMap.h"
 #include "imu_processing.hpp"
 #include "ivox3d/ivox3d.h"
 #include "options.h"
 #include "pointcloud_preprocess.h"
 #include "cuda_utils.h"
 #include "common_lib.h"
+#include "map_compression.h"
 
 namespace faster_lio {
 
@@ -54,6 +56,10 @@ class LaserMapping {
     void PGOOdomCallBack(const nav_msgs::Odometry::ConstPtr &msg);
     void KeyFrameIdCallBack(const std_msgs::Header::ConstPtr &msg);
 
+    // Service callbacks
+    bool SaveOptimizedMapService(faster_lio::SaveOptimizedMap::Request &req,
+                               faster_lio::SaveOptimizedMap::Response &res);
+
     // sync lidar with imu
     bool SyncPackages();
 
@@ -68,6 +74,12 @@ class LaserMapping {
     void PublishFrameLidar(const ros::Publisher &pub_laser_cloud_lidar);  // for PGO
     void PublishFrameEffectWorld(const ros::Publisher &pub_laser_cloud_effect_world);
     void Savetrajectory(const std::string &traj_file);
+
+    // Map extraction and optimization
+    bool ExtractOptimizedGlobalMap(PointCloudType::Ptr& global_map, bool apply_pgo_corrections = false);
+    bool ExtractOptimizedGlobalMapFast(PointCloudType::Ptr& global_map, bool apply_pgo_corrections = false);
+    bool ApplyPGOCorrections(PointCloudType::Ptr& map, const nav_msgs::Path& corrected_path);
+    bool ApplyPGOCorrectionsToScans(PointCloudType::Ptr& global_map);
 
     void Finish();
 
@@ -141,6 +153,9 @@ class LaserMapping {
     ros::Subscriber sub_pgo_odom_;
     ros::Subscriber sub_keyframes_id_;
     
+    // Service servers
+    ros::ServiceServer srv_save_optimized_map_;
+    
     std::string tf_imu_frame_;
     std::string tf_world_frame_;
 
@@ -155,6 +170,9 @@ class LaserMapping {
     nav_msgs::Path path_updated_;      // corrected path from PGO
     bool pgo_correction_available_ = false;
     std::vector<uint32_t> keyframe_ids_;  // received keyframe IDs from PGO
+
+    // Map compression utility
+    std::unique_ptr<MapCompression> map_compressor_;
 
     /// options
     bool time_sync_en_ = false;

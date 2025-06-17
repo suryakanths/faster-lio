@@ -1,0 +1,29 @@
+<!-- Launch FasterLIO with optimized map saving capability -->
+<launch>
+    <!-- FasterLIO parameters -->
+    <arg name="config_file" default="$(find faster_lio)/config/avia.yaml"/>
+    <arg name="lidar_topic" default="/livox/lidar"/>
+    <arg name="imu_topic" default="/livox/imu"/>
+    
+    <!-- Enable PCD saving to accumulate global map -->
+    <param name="pcd_save/pcd_save_en" value="true"/>
+    <param name="pcd_save/interval" value="-1"/>  <!-- Save all frames in one file -->
+    
+    <!-- FasterLIO main node -->
+    <node pkg="faster_lio" type="run_mapping_online" name="faster_lio_mapping" output="screen">
+        <rosparam file="$(arg config_file)" command="load"/>
+        <param name="common/lid_topic" value="$(arg lidar_topic)"/>
+        <param name="common/imu_topic" value="$(arg imu_topic)"/>
+    </node>
+    
+    <!-- RViz for visualization -->
+    <node pkg="rviz" type="rviz" name="rviz" 
+          args="-d $(find faster_lio)/rviz_cfg/loam_livox.rviz" output="screen"/>
+    
+    <!-- Service client examples (uncomment to use) -->
+    <!--
+    <node pkg="faster_lio" type="save_optimized_map.py" name="save_map_client" 
+          output="screen" args="/path/to/save/optimized_map.pcd"/>
+    -->
+    
+</launch>

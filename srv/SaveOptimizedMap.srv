@@ -1,0 +1,17 @@
+# Service to save the optimized PCD map with PGO corrections applied
+# Request
+string file_path                 # Path where to save the map (optional, uses default if empty)
+bool apply_pgo_corrections      # Whether to apply PGO pose corrections
+bool use_advanced_compression   # Use advanced compression algorithms
+float32 voxel_size              # Voxel size for downsampling (0 = no downsampling)
+float32 compression_ratio       # Target compression ratio (0.1-1.0, smaller = more compression)
+bool preserve_structure         # Preserve important structural features during compression
+---
+# Response
+bool success                    # Success flag
+string message                  # Status message
+string saved_file_path          # Actual file path where map was saved
+int32 original_points           # Number of points before compression
+int32 compressed_points         # Number of points after compression
+float32 compression_achieved    # Actual compression ratio achieved
+float64 file_size_mb           # Final file size in MB

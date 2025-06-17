@@ -305,6 +305,11 @@ void LaserMapping::SubAndPubToROS(ros::NodeHandle &nh) {
     sub_keyframes_id_ = nh.subscribe<std_msgs::Header>("/key_frames_ids", 100,
                                                        [this](const std_msgs::Header::ConstPtr &msg) { KeyFrameIdCallBack(msg); });
 
+    // Service servers
+    srv_save_optimized_map_ = nh.advertiseService("/save_optimized_map", 
+                                                 &LaserMapping::SaveOptimizedMapService, this);
+    LOG(INFO) << "SaveOptimizedMap service available at /save_optimized_map";
+
     // ROS publisher init
     path_.header.stamp = ros::Time::now();
     path_.header.frame_id = tf_world_frame_;
@@ -320,6 +325,15 @@ void LaserMapping::SubAndPubToROS(ros::NodeHandle &nh) {
 LaserMapping::LaserMapping() {
     preprocess_.reset(new PointCloudPreprocess());
     p_imu_.reset(new ImuProcess());
+    
+    // Initialize map compressor with default parameters
+    MapCompression::CompressionParams compression_params;
+    compression_params.voxel_size = 0.1f;
+    compression_params.target_compression_ratio = 0.3f;
+    compression_params.preserve_edges = true;
+    compression_params.preserve_corners = true;
+    map_compressor_.reset(new MapCompression(compression_params));
+    
 #ifdef USE_CUDA
     // Initialize CUDA processor
     cuda_processor_.reset(new CudaPointCloudProcessor());
@@ -996,6 +1010,218 @@ void LaserMapping::PointBodyLidarToIMU(PointType const *const pi, PointType *con
     po->y = p_body_imu(1);
     po->z = p_body_imu(2);
     po->intensity = pi->intensity;
+}
+
+bool LaserMapping::SaveOptimizedMapService(faster_lio::SaveOptimizedMap::Request &req,
+                                         faster_lio::SaveOptimizedMap::Response &res) {
+    LOG(INFO) << "SaveOptimizedMap service called";
+    
+    auto start_time = std::chrono::high_resolution_clock::now();
+    
+    try {
+        // Extract global map from IVox structure
+        PointCloudType::Ptr global_map(new PointCloudType);
+        if (!ExtractOptimizedGlobalMap(global_map, req.apply_pgo_corrections)) {
+            res.success = false;
+            res.message = "Failed to extract global map from IVox structure";
+            return true;
+        }
+        
+        res.original_points = global_map->size();
+        LOG(INFO) << "Extracted global map with " << res.original_points << " points";
+        
+        PointCloudType::Ptr compressed_map(new PointCloudType);
+        
+        // Apply compression if requested
+        if (req.use_advanced_compression && req.voxel_size > 0.0f) {
+            // Configure compression parameters
+            MapCompression::CompressionParams compression_params;
+            compression_params.voxel_size = req.voxel_size;
+            compression_params.target_compression_ratio = req.compression_ratio;
+            compression_params.preserve_edges = req.preserve_structure;
+            compression_params.preserve_corners = req.preserve_structure;
+            compression_params.preserve_planar_regions = req.preserve_structure;
+            
+            map_compressor_->SetCompressionParams(compression_params);
+            
+            // Apply smart compression
+            auto compression_result = map_compressor_->CompressSmart(global_map, compressed_map);
+            
+            if (!compression_result.success) {
+                LOG(WARNING) << "Advanced compression failed, falling back to basic voxel grid";
+                // Fallback to basic voxel grid
+                pcl::VoxelGrid<PointType> voxel_filter;
+                voxel_filter.setInputCloud(global_map);
+                voxel_filter.setLeafSize(req.voxel_size, req.voxel_size, req.voxel_size);
+                voxel_filter.filter(*compressed_map);
+                res.compression_achieved = static_cast<float>(compressed_map->size()) / res.original_points;
+            } else {
+                res.compression_achieved = compression_result.compression_ratio;
+                LOG(INFO) << "Applied " << compression_result.compression_method 
+                          << " compression in " << compression_result.processing_time_ms << " ms";
+            }
+        } else if (req.voxel_size > 0.0f) {
+            // Basic voxel grid downsampling
+            pcl::VoxelGrid<PointType> voxel_filter;
+            voxel_filter.setInputCloud(global_map);
+            voxel_filter.setLeafSize(req.voxel_size, req.voxel_size, req.voxel_size);
+            voxel_filter.filter(*compressed_map);
+            res.compression_achieved = static_cast<float>(compressed_map->size()) / res.original_points;
+        } else {
+            // No compression
+            compressed_map = global_map;
+            res.compression_achieved = 1.0f;
+        }
+        
+        res.compressed_points = compressed_map->size();
+        
+        // Determine save path
+        std::string save_path = req.file_path;
+        if (save_path.empty()) {
+            save_path = std::string(ROOT_DIR) + "PCD/optimized_map_" + 
+                       std::to_string(std::time(nullptr)) + ".pcd";
+        }
+        
+        // Ensure .pcd extension
+        if (save_path.substr(save_path.length() - 4) != ".pcd") {
+            save_path += ".pcd";
+        }
+        
+        // Create directory if it doesn't exist
+        std::string dir_path = save_path.substr(0, save_path.find_last_of("/"));
+        std::string mkdir_cmd = "mkdir -p " + dir_path;
+        int mkdir_result = system(mkdir_cmd.c_str());
+        if (mkdir_result != 0) {
+            LOG(WARNING) << "Failed to create directory: " << dir_path;
+        }
+        
+        // Save the map
+        pcl::PCDWriter pcd_writer;
+        if (pcd_writer.writeBinary(save_path, *compressed_map) == 0) {
+            res.success = true;
+            res.saved_file_path = save_path;
+            res.message = "Map saved successfully";
+            
+            // Calculate file size
+            std::ifstream file(save_path, std::ifstream::ate | std::ifstream::binary);
+            if (file.is_open()) {
+                res.file_size_mb = static_cast<double>(file.tellg()) / (1024.0 * 1024.0);
+                file.close();
+            }
+            
+            LOG(INFO) << "Optimized map saved to: " << save_path;
+            LOG(INFO) << "Original points: " << res.original_points;
+            LOG(INFO) << "Compressed points: " << res.compressed_points;
+            LOG(INFO) << "Compression ratio: " << res.compression_achieved;
+            LOG(INFO) << "File size: " << res.file_size_mb << " MB";
+            
+        } else {
+            res.success = false;
+            res.message = "Failed to save PCD file to: " + save_path;
+            LOG(ERROR) << res.message;
+        }
+        
+    } catch (const std::exception& e) {
+        res.success = false;
+        res.message = "Exception occurred: " + std::string(e.what());
+        LOG(ERROR) << res.message;
+    }
+    
+    auto end_time = std::chrono::high_resolution_clock::now();
+    double processing_time = std::chrono::duration<double, std::milli>(end_time - start_time).count();
+    LOG(INFO) << "SaveOptimizedMap service completed in " << processing_time << " ms";
+    
+    return true;
+}
+
+bool LaserMapping::ExtractOptimizedGlobalMap(PointCloudType::Ptr& global_map, bool apply_pgo_corrections) {
+    if (!ivox_ || !global_map) {
+        LOG(ERROR) << "Invalid IVox structure or output cloud pointer";
+        return false;
+    }
+    
+    try {
+        global_map->clear();
+        
+        // Extract all points from IVox structure
+        // Since IVox doesn't have a direct method to extract all points,
+        // we'll use the accumulated pcl_wait_save_ if available, or reconstruct from scan history
+        
+        if (pcd_save_en_ && pcl_wait_save_ && !pcl_wait_save_->empty()) {
+            // Use accumulated point cloud if available
+            *global_map = *pcl_wait_save_;
+            LOG(INFO) << "Extracted global map from accumulated point cloud: " << global_map->size() << " points";
+        } else {
+            LOG(WARNING) << "No accumulated point cloud available, cannot extract global map";
+            LOG(WARNING) << "Enable pcd_save_en in config to accumulate points for global map extraction";
+            return false;
+        }
+        
+        // Apply PGO corrections if requested and available
+        if (apply_pgo_corrections && pgo_correction_available_ && !path_updated_.poses.empty()) {
+            LOG(INFO) << "Applying PGO corrections to global map";
+            if (!ApplyPGOCorrections(global_map, path_updated_)) {
+                LOG(WARNING) << "Failed to apply PGO corrections, using uncorrected map";
+            }
+        }
+        
+        return !global_map->empty();
+        
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "Failed to extract global map: " << e.what();
+        return false;
+    }
+}
+
+bool LaserMapping::ApplyPGOCorrections(PointCloudType::Ptr& map, const nav_msgs::Path& corrected_path) {
+    if (!map || map->empty() || corrected_path.poses.empty()) {
+        LOG(ERROR) << "Invalid input for PGO correction";
+        return false;
+    }
+    
+    try {
+        // This is a simplified implementation
+        // In a real system, you would need to:
+        // 1. Associate each point with its corresponding pose/timestamp
+        // 2. Apply the transformation difference between original and corrected poses
+        // 3. Transform each point accordingly
+        
+        // For now, we'll apply a simple correction based on the pose differences
+        // This assumes the map points are in the coordinate frame of the final pose
+        
+        if (corrected_path.poses.size() >= 2) {
+            // Get the transformation from the last original pose to the last corrected pose
+            const auto& last_corrected = corrected_path.poses.back();
+            const auto& current_pose = path_.poses.empty() ? geometry_msgs::PoseStamped() : path_.poses.back();
+            
+            if (!path_.poses.empty()) {
+                // Calculate transformation difference
+                Eigen::Vector3f translation_diff(
+                    last_corrected.pose.position.x - current_pose.pose.position.x,
+                    last_corrected.pose.position.y - current_pose.pose.position.y,
+                    last_corrected.pose.position.z - current_pose.pose.position.z
+                );
+                
+                // Apply translation correction to all points
+                for (auto& point : map->points) {
+                    point.x += translation_diff.x();
+                    point.y += translation_diff.y();
+                    point.z += translation_diff.z();
+                }
+                
+                LOG(INFO) << "Applied PGO correction: translation (" 
+                          << translation_diff.x() << ", " 
+                          << translation_diff.y() << ", " 
+                          << translation_diff.z() << ")";
+            }
+        }
+        
+        return true;
+        
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "Failed to apply PGO corrections: " << e.what();
+        return false;
+    }
 }
 
 void LaserMapping::Finish() {

@@ -8,8 +8,14 @@ target_link_libraries(run_mapping_offline
         ${PROJECT_NAME} gflags
         )
 
+add_executable(save_optimized_map_client save_optimized_map_client.cc)
+target_link_libraries(save_optimized_map_client
+        ${catkin_LIBRARIES}
+        )
+
 # Set CUDA properties for executables if CUDA is enabled (CUDA 10.1 supports up to C++14)
 if(USE_CUDA AND CUDA_FOUND)
     set_property(TARGET run_mapping_online PROPERTY CUDA_STANDARD 14)
     set_property(TARGET run_mapping_offline PROPERTY CUDA_STANDARD 14)
+    set_property(TARGET save_optimized_map_client PROPERTY CUDA_STANDARD 14)
 endif()

@@ -5,6 +5,7 @@ set(FASTER_LIO_SOURCES
     options.cc
     utils.cc
     jetson_optimizations.cc
+    map_compression.cc
 )
 
 # Always include CPU fallback implementation

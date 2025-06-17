@@ -34,9 +34,15 @@ add_message_files(
         Pose6D.msg
 )
 
+add_service_files(
+        FILES
+        SaveOptimizedMap.srv
+)
+
 generate_messages(
         DEPENDENCIES
         geometry_msgs
+        std_msgs
 )
 catkin_package(
         CATKIN_DEPENDS geometry_msgs nav_msgs roscpp rospy std_msgs message_runtime
