@@ -79,21 +79,5 @@ bool DownsamplePointCloud(const PointCloudType::Ptr& input_cloud,
 } // namespace cuda_utils
 } // namespace faster_lio
 
-#ifndef USE_CUDA
-// CPU implementations for when CUDA is not available
-bool CudaPointCloudProcessor::DownsamplePointCloud(const PointCloudType::Ptr& input_cloud,
-                                                  PointCloudType::Ptr& output_cloud,
-                                                  float voxel_size) {
-    if (!input_cloud || input_cloud->empty()) {
-        return false;
-    }
-    
-    pcl::VoxelGrid<PointType> voxel_filter;
-    voxel_filter.setInputCloud(input_cloud);
-    voxel_filter.setLeafSize(voxel_size, voxel_size, voxel_size);
-    voxel_filter.filter(*output_cloud);
-    return true;
-}
-#endif
-
-// CPU fallback utility functions
+// This file provides CPU fallback implementations for CUDA utilities
+// The actual CudaPointCloudProcessor implementations are in the header when USE_CUDA is not defined

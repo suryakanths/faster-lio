@@ -4,9 +4,11 @@ set(FASTER_LIO_SOURCES
     pointcloud_preprocess.cc
     options.cc
     utils.cc
-    cuda_utils_cpu.cc
     jetson_optimizations.cc
 )
+
+# Always include CPU fallback implementation
+list(APPEND FASTER_LIO_SOURCES cuda_utils_cpu.cc)
 
 # Add CUDA source files if CUDA is enabled
 if(USE_CUDA AND CUDA_FOUND)
