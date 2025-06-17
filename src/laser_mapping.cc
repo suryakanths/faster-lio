@@ -95,6 +95,17 @@ bool LaserMapping::LoadParams(ros::NodeHandle &nh) {
     nh.param<float>("ivox_grid_resolution", ivox_options_.resolution_, 0.2);
     nh.param<int>("ivox_nearby_type", ivox_nearby_type, 18);
 
+#ifdef USE_CUDA
+    bool enable_cuda_acceleration = true;
+    nh.param<bool>("cuda/enable_acceleration", enable_cuda_acceleration, true);
+    if (enable_cuda_acceleration && CudaPointCloudProcessor::IsCudaAvailable()) {
+        EnableCudaAcceleration(true);
+        LOG(INFO) << "CUDA acceleration enabled";
+    } else {
+        LOG(INFO) << "CUDA acceleration disabled or not available";
+    }
+#endif
+
     LOG(INFO) << "lidar_type " << lidar_type;
     if (lidar_type == 1) {
         preprocess_->SetLidarType(LidarType::AVIA);
@@ -148,6 +159,12 @@ bool LaserMapping::LoadParamsFromYAML(const std::string &yaml_file) {
     common::M3D lidar_R_wrt_IMU;
 
     auto yaml = YAML::LoadFile(yaml_file);
+    
+#ifdef USE_CUDA
+    // Try to load CUDA configuration, default to true if not present
+    bool enable_cuda_acceleration = true;
+#endif
+    
     try {
         path_pub_en_ = yaml["publish"]["path_publish_en"].as<bool>();
         scan_pub_en_ = yaml["publish"]["scan_publish_en"].as<bool>();
@@ -184,10 +201,25 @@ bool LaserMapping::LoadParamsFromYAML(const std::string &yaml_file) {
 
         ivox_options_.resolution_ = yaml["ivox_grid_resolution"].as<float>();
         ivox_nearby_type = yaml["ivox_nearby_type"].as<int>();
+
+#ifdef USE_CUDA
+        if (yaml["cuda"] && yaml["cuda"]["enable_acceleration"]) {
+            enable_cuda_acceleration = yaml["cuda"]["enable_acceleration"].as<bool>();
+        }
+#endif
     } catch (...) {
         LOG(ERROR) << "bad conversion";
         return false;
     }
+
+#ifdef USE_CUDA
+    if (enable_cuda_acceleration && CudaPointCloudProcessor::IsCudaAvailable()) {
+        EnableCudaAcceleration(true);
+        LOG(INFO) << "CUDA acceleration enabled from YAML config";
+    } else {
+        LOG(INFO) << "CUDA acceleration disabled or not available from YAML config";
+    }
+#endif
 
     LOG(INFO) << "lidar_type " << lidar_type;
     if (lidar_type == 1) {
@@ -232,6 +264,24 @@ bool LaserMapping::LoadParamsFromYAML(const std::string &yaml_file) {
     return true;
 }
 
+#ifdef USE_CUDA
+void LaserMapping::EnableCudaAcceleration(bool enable) {
+    if (cuda_processor_) {
+        // Enable/disable CUDA acceleration for preprocessing as well
+        if (preprocess_) {
+            preprocess_->EnableCudaAcceleration(enable);
+        }
+        LOG(INFO) << "CUDA acceleration " << (enable ? "enabled" : "disabled") << " for LaserMapping";
+    } else {
+        LOG(WARNING) << "CUDA processor not available, cannot enable CUDA acceleration";
+    }
+}
+
+bool LaserMapping::IsCudaAccelerationEnabled() const {
+    return cuda_processor_ && preprocess_ && preprocess_->IsCudaAccelerationEnabled();
+}
+#endif
+
 void LaserMapping::SubAndPubToROS(ros::NodeHandle &nh) {
     // ROS subscribe initialization
     std::string lidar_topic, imu_topic;
@@ -270,6 +320,11 @@ void LaserMapping::SubAndPubToROS(ros::NodeHandle &nh) {
 LaserMapping::LaserMapping() {
     preprocess_.reset(new PointCloudPreprocess());
     p_imu_.reset(new ImuProcess());
+#ifdef USE_CUDA
+    // Initialize CUDA processor
+    cuda_processor_.reset(new CudaPointCloudProcessor());
+    LOG(INFO) << "CUDA acceleration initialized for LaserMapping";
+#endif
 }
 
 void LaserMapping::Run() {
@@ -530,7 +585,7 @@ void LaserMapping::MapIncremental() {
         index[i] = i;
     }
 
-    std::for_each(std::execution::unseq, index.begin(), index.end(), [&](const size_t &i) {
+    std::for_each(index.begin(), index.end(), [&](const size_t &i) {
         /* transform to world frame */
         PointBodyToWorld(&(scan_down_body_->points[i]), &(scan_down_world_->points[i]));
 
@@ -597,8 +652,64 @@ void LaserMapping::ObsModel(state_ikfom &s, esekfom::dyn_share_datastruct<double
             auto R_wl = (s.rot * s.offset_R_L_I).cast<float>();
             auto t_wl = (s.rot * s.offset_T_L_I + s.pos).cast<float>();
 
-            /** closest surface search and residual computation **/
-            std::for_each(std::execution::par_unseq, index.begin(), index.end(), [&](const size_t &i) {
+#ifdef USE_CUDA
+            // Try CUDA acceleration for point transformation if available
+            if (cuda_processor_ && IsCudaAccelerationEnabled() && cnt_pts > 1000) {
+                // Convert rotation matrix to float array for CUDA
+                auto R_matrix = R_wl.toRotationMatrix();
+                float rotation_matrix[9];
+                float translation_vector[3];
+                
+                // Copy rotation matrix data
+                for (int i = 0; i < 3; ++i) {
+                    for (int j = 0; j < 3; ++j) {
+                        rotation_matrix[i * 3 + j] = R_matrix(i, j);
+                    }
+                }
+                
+                // Copy translation vector data  
+                translation_vector[0] = t_wl.x();
+                translation_vector[1] = t_wl.y();
+                translation_vector[2] = t_wl.z();
+                
+                // Use CUDA for large point clouds
+                if (cuda_processor_->TransformPointCloud(scan_down_body_, scan_down_world_, 
+                                                       rotation_matrix, translation_vector)) {
+                    // CUDA transformation successful, continue with CPU for nearest neighbor search
+                    // TODO: Add CUDA nearest neighbor search in future iteration
+                    std::for_each(index.begin(), index.end(), [&](const size_t &i) {
+                        PointType &point_world = scan_down_world_->points[i];
+                        auto &points_near = nearest_points_[i];
+                        if (ekfom_data.converge) {
+                            ivox_->GetClosestPoint(point_world, points_near, options::NUM_MATCH_POINTS);
+                            point_selected_surf_[i] = points_near.size() >= options::MIN_NUM_MATCH_POINTS;
+                            if (point_selected_surf_[i]) {
+                                point_selected_surf_[i] =
+                                    common::esti_plane(plane_coef_[i], points_near, options::ESTI_PLANE_THRESHOLD);
+                            }
+                        }
+
+                        if (point_selected_surf_[i]) {
+                            auto temp = point_world.getVector4fMap();
+                            temp[3] = 1.0;
+                            float pd2 = plane_coef_[i].dot(temp);
+                            
+                            PointType &point_body = scan_down_body_->points[i];
+                            common::V3F p_body = point_body.getVector3fMap();
+                            bool valid_corr = p_body.norm() > 81 * pd2 * pd2;
+                            if (valid_corr) {
+                                point_selected_surf_[i] = true;
+                                residuals_[i] = pd2;
+                            }
+                        }
+                    });
+                    return; // Skip CPU fallback
+                }
+            }
+#endif
+
+            /** closest surface search and residual computation (CPU fallback) **/
+            std::for_each(index.begin(), index.end(), [&](const size_t &i) {
                 PointType &point_body = scan_down_body_->points[i];
                 PointType &point_world = scan_down_world_->points[i];
 
@@ -664,9 +775,8 @@ void LaserMapping::ObsModel(state_ikfom &s, esekfom::dyn_share_datastruct<double
             index.resize(effect_feat_num_);
             const common::M3F off_R = s.offset_R_L_I.toRotationMatrix().cast<float>();
             const common::V3F off_t = s.offset_T_L_I.cast<float>();
-            const common::M3F Rt = s.rot.toRotationMatrix().transpose().cast<float>();
-
-            std::for_each(std::execution::par_unseq, index.begin(), index.end(), [&](const size_t &i) {
+            const common::M3F Rt = s.rot.toRotationMatrix().transpose().cast<float>();            
+            std::for_each(index.begin(), index.end(), [&](const size_t &i) {
                 common::V3F point_this_be = corr_pts_[i].head<3>();
                 common::M3F point_be_crossmat = SKEW_SYM_MATRIX(point_this_be);
                 common::V3F point_this = off_R * point_this_be + off_t;

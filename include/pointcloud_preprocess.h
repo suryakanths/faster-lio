@@ -8,6 +8,7 @@
 #include <pcl/point_types.h>
 
 #include "common_lib.h"
+#include "cuda_utils.h"
 
 namespace velodyne_ros {
 struct EIGEN_ALIGN16 Point {
@@ -65,13 +66,17 @@ class PointCloudPreprocess {
    public:
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 
-    PointCloudPreprocess() = default;
+    PointCloudPreprocess();
     ~PointCloudPreprocess() = default;
 
     /// processors
     void Process(const livox_ros_driver::CustomMsg::ConstPtr &msg, PointCloudType::Ptr &pcl_out);
     void Process(const sensor_msgs::PointCloud2::ConstPtr &msg, PointCloudType::Ptr &pcl_out);
     void Set(LidarType lid_type, double bld, int pfilt_num);
+
+    // CUDA acceleration control
+    void EnableCudaAcceleration(bool enable = true);
+    bool IsCudaAccelerationEnabled() const { return use_cuda_; }
 
     // accessors
     double &Blind() { return blind_; }
@@ -96,6 +101,10 @@ class PointCloudPreprocess {
     double blind_ = 0.01;
     float time_scale_ = 1e-3;
     bool given_offset_time_ = false;
+    
+    // CUDA acceleration
+    bool use_cuda_ = false;
+    std::unique_ptr<CudaPointCloudProcessor> cuda_processor_;
 };
 }  // namespace faster_lio
 

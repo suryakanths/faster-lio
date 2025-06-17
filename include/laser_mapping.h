@@ -14,6 +14,8 @@
 #include "ivox3d/ivox3d.h"
 #include "options.h"
 #include "pointcloud_preprocess.h"
+#include "cuda_utils.h"
+#include "common_lib.h"
 
 namespace faster_lio {
 
@@ -79,6 +81,12 @@ class LaserMapping {
 
     void MapIncremental();
 
+#ifdef USE_CUDA
+    /// CUDA-accelerated helper methods
+    void EnableCudaAcceleration(bool enable = true);
+    bool IsCudaAccelerationEnabled() const;
+#endif
+
     void SubAndPubToROS(ros::NodeHandle &nh);
 
     bool LoadParams(ros::NodeHandle &nh);
@@ -92,6 +100,9 @@ class LaserMapping {
     std::shared_ptr<IVoxType> ivox_ = nullptr;                    // localmap in ivox
     std::shared_ptr<PointCloudPreprocess> preprocess_ = nullptr;  // point cloud preprocess
     std::shared_ptr<ImuProcess> p_imu_ = nullptr;                 // imu process
+#ifdef USE_CUDA
+    std::shared_ptr<CudaPointCloudProcessor> cuda_processor_ = nullptr;  // CUDA processor
+#endif
 
     /// local map related
     float det_range_ = 300.0f;

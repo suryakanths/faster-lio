@@ -5,6 +5,8 @@
 #ifndef FAST_LIO_OPTIONS_H
 #define FAST_LIO_OPTIONS_H
 
+#ifdef __cplusplus
+
 namespace faster_lio::options {
 
 /// fixed params
@@ -20,5 +22,7 @@ extern float ESTI_PLANE_THRESHOLD;  // plane threshold
 extern bool FLAG_EXIT;              // flag for exitting
 
 }  // namespace faster_lio::options
+
+#endif
 
 #endif  // FAST_LIO_OPTIONS_H

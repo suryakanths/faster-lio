@@ -5,6 +5,30 @@
 
 namespace faster_lio {
 
+PointCloudPreprocess::PointCloudPreprocess() : use_cuda_(false) {
+    // Initialize CUDA processor if available
+    if (CudaPointCloudProcessor::IsCudaAvailable()) {
+        cuda_processor_ = std::make_unique<CudaPointCloudProcessor>();
+        use_cuda_ = true;
+        LOG(INFO) << "CUDA acceleration enabled for point cloud preprocessing";
+    } else {
+        LOG(INFO) << "CUDA not available, using CPU-only point cloud preprocessing";
+    }
+}
+
+void PointCloudPreprocess::EnableCudaAcceleration(bool enable) {
+    if (enable && CudaPointCloudProcessor::IsCudaAvailable()) {
+        if (!cuda_processor_) {
+            cuda_processor_ = std::make_unique<CudaPointCloudProcessor>();
+        }
+        use_cuda_ = true;
+        LOG(INFO) << "CUDA acceleration enabled";
+    } else {
+        use_cuda_ = false;
+        LOG(INFO) << "CUDA acceleration disabled";
+    }
+}
+
 void PointCloudPreprocess::Set(LidarType lid_type, double bld, int pfilt_num) {
     lidar_type_ = lid_type;
     blind_ = bld;
@@ -47,7 +71,7 @@ void PointCloudPreprocess::AviaHandler(const livox_ros_driver::CustomMsg::ConstP
         index[i] = i + 1;  // 从1开始
     }
 
-    std::for_each(std::execution::par_unseq, index.begin(), index.end(), [&](const uint &i) {
+    std::for_each(index.begin(), index.end(), [&](const uint &i) {
         if ((msg->points[i].line < num_scans_) &&
             ((msg->points[i].tag & 0x30) == 0x10 || (msg->points[i].tag & 0x30) == 0x00)) {
             if (i % point_filter_num_ == 0) {
@@ -74,6 +98,22 @@ void PointCloudPreprocess::AviaHandler(const livox_ros_driver::CustomMsg::ConstP
     for (uint i = 1; i < plsize; i++) {
         if (is_valid_pt[i]) {
             cloud_out_.points.push_back(cloud_full_[i]);
+        }
+    }
+    
+    // Apply CUDA-accelerated filtering if enabled
+    if (use_cuda_ && cuda_processor_ && cloud_out_.points.size() > 1000) {
+        PointCloudType::Ptr input_cloud(new PointCloudType(cloud_out_));
+        PointCloudType::Ptr filtered_cloud(new PointCloudType);
+        bool success = cuda_processor_->FilterPointsByDistance(
+            input_cloud,
+            filtered_cloud,
+            blind_,
+            300.0f  // max range
+        );
+        
+        if (success) {
+            cloud_out_ = *filtered_cloud;
         }
     }
 }

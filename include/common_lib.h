@@ -1,3 +1,4 @@
+#ifdef __cplusplus
 #ifndef COMMON_LIB_H
 #define COMMON_LIB_H
 
@@ -247,4 +248,5 @@ inline bool esti_plane(Eigen::Matrix<T, 4, 1> &pca_result, const PointVector &po
 }
 
 }  // namespace faster_lio::common
+#endif
 #endif

@@ -75,7 +75,7 @@ inline size_t hash_vec<3>::operator()(const Eigen::Matrix<int, 3, 1>& v) const {
     return size_t(((v[0]) * 73856093) ^ ((v[1]) * 471943) ^ ((v[2]) * 83492791)) % 10000000;
 }
 
-constexpr auto less_vec2i = [](const Vec2i& v1, const Vec2i& v2) {
+auto less_vec2i = [](const Vec2i& v1, const Vec2i& v2) {
     return v1[0] < v2[0] || (v1[0] == v2[0] && v1[1] < v2[1]);
 };
 

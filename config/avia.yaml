@@ -46,3 +46,8 @@ cube_side_length: 1000
 ivox_grid_resolution: 0.5        # default=0.2
 ivox_nearby_type: 18             # 6, 18, 26
 esti_plane_threshold: 0.1        # default=0.1
+
+# CUDA acceleration settings
+cuda:
+  enable_acceleration: true      # Enable CUDA acceleration if available (requires NVIDIA GPU)
+                                # Falls back to CPU processing if CUDA is not available
